@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+if grep -q 'BINARY_PATH' '/etc/crowdsec/bouncers/crowdsec-custom-bouncer.yaml'; then
+    yq -i eval '.bin_path = "/app/unifi.py"' /etc/crowdsec/bouncers/crowdsec-custom-bouncer.yaml
+    yq -i eval '.api_url = strenv(CROWDSEC_LAPI_URL)' /etc/crowdsec/bouncers/crowdsec-custom-bouncer.yaml
+    yq -i eval '.api_key = strenv(CROWDSEC_API_KEY)' /etc/crowdsec/bouncers/crowdsec-custom-bouncer.yaml
+fi

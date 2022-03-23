@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+exec \
+    /app/crowdsec-custom-bouncer -c /etc/crowdsec/bouncers/crowdsec-custom-bouncer.yaml
