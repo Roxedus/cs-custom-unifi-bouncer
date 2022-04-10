@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
-import requests
-import sys
-import os
-from ipaddress import ip_network, IPv4Network, IPv6Network
 import logging
 import logging.handlers
+import os
+import sys
+import time
+from ipaddress import IPv4Network, IPv6Network, ip_network
+
+import requests
+from pycrowdsec.client import StreamClient as CrowdSecClient
 
 
 class UnifiAuthenticationException(Exception):
     pass
 
 
+class UnifiAPIException(Exception):
+    pass
+
+
 class Unifi:
     """Unifi API wrapper"""
 
-    def __init__(self, username, password, base_url, authenticate=True):
+    def __init__(self, username, password, base_url, site, authenticate=True):
         """
         Initialize the Unifi API
         :param ignore_ssl: Ignore Unifi SSL certificate validity
         :param username: Unifi username
         :param password: Unifi password
         :param base_url: Unifi API base URL
-        :param site: Site (defaults to the default site)
+        :param site: Site
         :param authenticate: Authenticate after instantiating class
         """
         # Set class-level variables
@@ -29,7 +36,7 @@ class Unifi:
         self.username = username
         self.password = password
         self.base_url = base_url
-        self.site = os.environ.get("UNIFI_SITE")
+        self.site = site
         self.session = requests.Session()
 
         if self.ignore_ssl.lower() == "true":
@@ -41,6 +48,8 @@ class Unifi:
         # Authenticate
         if authenticate:
             self.authenticate()
+
+        log.info("Connection made to unifi")
     # Authenticate against the Unifi API
 
     def authenticate(self):
@@ -63,81 +72,97 @@ class Unifi:
         Get existing firewall group
         :return: firewall group info
         """
-        firewallGroup = ''
+        firewallGroup = []
         response = self.session.get(
             f"{self.base_url}/api/s/{self.site}/rest/firewallgroup/{group_id}", verify=False).json()
         if response.get('meta').get('rc') == 'ok' and len(response.get('data')) == 1:
             firewallGroup = response.get('data')[0]
-        return firewallGroup if firewallGroup else False
+        if response.get('meta').get('rc') == 'error':
+            raise UnifiAPIException(response.get('meta').get('msg'))
+        return firewallGroup
 
     def editFirewallGroup(self, group_id, data):
         """
         Edit firewall group
         :return: edit successful
         """
+        payload = self.getFirewallGroup(group_id)
+        payload["group_members"] = data
         response = self.session.put(
-            f"{self.base_url}/api/s/{self.site}/rest/firewallgroup/{group_id}", json=data, verify=False)
-        if response.status_code == 200:
-            return True
-        return False
+            f"{self.base_url}/api/s/{self.site}/rest/firewallgroup/{group_id}", json=payload, verify=False)
+        assert response.json().get('meta').get('rc') == 'ok', response.get('meta').get('msg')
+        return True
 
 
-def main(argv):
+def main():
     username = os.environ.get("UNIFI_USERNAME")
     password = os.environ.get("UNIFI_PASSWORD")
-    base_url = os.environ.get("UNIFI_BASE_URL")
-    group4_id = os.environ.get("UNIFI_IPV4_GROUP_ID")
-    group6_id = os.environ.get("UNIFI_IPV6_GROUP_ID")
+    site = os.environ.get("UNIFI_SITE", default="Default")
+    base_url = os.environ.get("UNIFI_BASE_URL", default="https://unifi-controller:8443")
+    group4_id = os.environ.get("UNIFI_IPV4_GROUP_ID", default=False)
+    group6_id = os.environ.get("UNIFI_IPV6_GROUP_ID", default=False)
 
-    unifi = Unifi(username, password, base_url)
+    crowd = CrowdSecClient(
+        api_key="b33dc8e982891b211b8cb0598f82d318",
+        lapi_url="http://crowdsec:8080/"
+    )
 
-    log.info(f"Connection made")
-    log.debug(f"Args: {argv}")
-    command = argv[1]
-    ipaddr = argv[2]
+    crowd.run()
 
-    try:
-        fam = ip_network(ipaddr)
-        if type(fam) is IPv4Network:
-            group_id = group4_id
-            log.debug("Family is IPV4")
-        elif type(fam) is IPv6Network:
-            group_id = group6_id
-            log.debug("Family is IPV6")
+    log.info("Connection made to crowdsec")
+
+    unifi = Unifi(username, password, base_url, site)
+
+    if group4_id:
+        fw_group = unifi.getFirewallGroup(group4_id)
+        log.debug("There is currently %s items in the list %s", len(
+            fw_group.get("group_members")), fw_group.get("name"))
+
+    if group6_id:
+        fw_group = unifi.getFirewallGroup(group6_id)
+        log.debug("There is currently %s items in the list %s", len(
+            fw_group.get("group_members")), fw_group.get("name"))
+
+    while crowd.is_running():
+        try:
+            decisions = crowd.get_current_decisions()
+            break
+        except RuntimeError:
+            pass
+
+    time.sleep(3)
+
+    ipv_4_decisions = []
+    ipv_6_decisions = []
+
+    bans = 0
+
+    for i, action in decisions.items():
+        if action != "ban":
+            print(f"{i} is {action}")
         else:
-            log.error("Family is not found")
-            sys.exit(f"Error: {ipaddr} is not a ip family")
-    except ValueError:
-        log.error(f"{ipaddr} is not a valid ip address")
-        sys.exit(f"Error: {ipaddr} is not a valid ip address")
-    current_rule = unifi.getFirewallGroup(group_id)
-    log.debug(f"Current rule: {current_rule}")
-    new_rule = ""
+            fam = ip_network(i)
+            if isinstance(fam, IPv4Network):
+                i = i.replace("/32", "")
+                ipv_4_decisions.append(i)
+                bans += 1
+            elif isinstance(fam, IPv6Network):
+                i = i.replace("/128", "")
+                ipv_6_decisions.append(i)
+                bans += 1
+            else:
+                log.warning("Halp dunno what to do with %s", i)
 
-    if current_rule == False:
-        log.error(msg)(f"No Rule found for group {group_id}")
-        sys.exit("Error: Something went wrong getting the existing group")
+    log.debug("There is a total of %s decisions in CrowdSec. IPV4: %s IPV6: %s",
+              len(decisions), len(ipv_4_decisions), len(ipv_6_decisions))
 
-    if command == 'add':
-        log.info(f"Banning {ipaddr}")
-        current_rule["group_members"].append(ipaddr)
-        new_rule = unifi.editFirewallGroup(group_id, current_rule)
-        l  # og.debug(f"New rule: {new_rule}")
-    elif command == 'del':
-        log.info(f"Un-Banning {ipaddr}")
-        if ipaddr not in current_rule["group_members"]:
-            log.error(f"{ipaddr} is not banned")
-            sys.exit(f"Error: {ipaddr} is not banned")
-        current_rule["group_members"].remove(ipaddr)
-        new_rule = unifi.editFirewallGroup(group_id, current_rule)
-        #log.debug(f"New rule: {new_rule}")
-    else:
-        log.error("Unknown command")
-        sys.exit("Unknown command")
+    if group4_id:
+        unifi.editFirewallGroup(group4_id, ipv_4_decisions)
+        log.debug("Adding IPv4 decisions to UniFi")
 
-    if new_rule == False:
-        log.error("New rule not set")
-        sys.exit("Error: Something went wrong when updating the group")
+    if group6_id:
+        unifi.editFirewallGroup(group4_id, ipv_6_decisions)
+        log.debug("Adding IPv6 decisions to UniFi")
 
 
 # Main
@@ -145,7 +170,7 @@ if __name__ == "__main__":
     log = logging.getLogger("CS-Bouncer-Logger")
 
     file_handler = logging.handlers.WatchedFileHandler(
-        os.environ.get("LOGFILE", "/var/log/cs.log"))
+        os.environ.get("LOGFILE", "cs.log"))  # /var/log/
     formatter = logging.Formatter(logging.BASIC_FORMAT)
     file_handler.setFormatter(formatter)
 
@@ -158,4 +183,4 @@ if __name__ == "__main__":
 
     log.info("Starting thing")
 
-    main(sys.argv)
+    main()
